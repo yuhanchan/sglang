@@ -17,11 +17,12 @@ use crate::policies::{
     request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
     SelectionContext,
 };
+use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
-    WorkerModeLabel,
+    StreamOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -769,6 +770,38 @@ pub async fn chat_completions(
         start,
     };
 
+    // Builds the end-of-stream hook the SSE pump fires when a 2xx stream
+    // finishes, classifying what happened AFTER the 200 was committed —
+    // the one thing no headers-time metric can see. Takes the URL of the
+    // worker that serves the stream (Final D in PD mode).
+    let make_stream_end_hook = |worker_url: String| -> Box<dyn FnOnce(StreamEnd) + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        Box::new(move |end: StreamEnd| {
+            // An in-band error outranks transport state: the engine
+            // definitively reported failure. A broken transport outranks a
+            // disconnect observed on the same stream.
+            let outcome = if end.saw_inband_error {
+                StreamOutcome::InbandError
+            } else if !end.transport_ok {
+                StreamOutcome::UpstreamError
+            } else if end.client_disconnect {
+                StreamOutcome::ClientDisconnect
+            } else {
+                StreamOutcome::Ok
+            };
+            metrics.record_stream_outcome(&worker_url, &model, outcome);
+        })
+    };
+
+    // Builds the inter-chunk hook recording `sgl_router_itl_seconds`. The
+    // proxy fires it per non-empty upstream chunk after the first, 2xx only.
+    let make_itl_hook = || -> Box<dyn Fn(f64) + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        Box::new(move |gap| metrics.observe_itl(&model, gap))
+    };
+
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
     // engine-equivalent (chat-encoder path) AND the request contains nothing
@@ -909,6 +942,8 @@ pub async fn chat_completions(
                 outgoing_body,
                 Some(stream_guards),
                 Some(make_ttft_hook()),
+                Some(make_stream_end_hook(decode_worker.url.clone())),
+                Some(make_itl_hook()),
             );
             tokio::select! {
                 biased;
@@ -944,6 +979,8 @@ pub async fn chat_completions(
             outgoing_body,
             Some(stream_guards),
             Some(make_ttft_hook()),
+            Some(make_stream_end_hook(worker.url.clone())),
+            Some(make_itl_hook()),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
